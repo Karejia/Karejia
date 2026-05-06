@@ -1,0 +1,403 @@
+"""
+訂單執行模組 - 完整版（完整 CSV 記錄）
+負責實際下單、平倉等操作，記錄完整交易數據供分析
+"""
+from typing import Dict, Optional, List
+from datetime import datetime
+import csv
+import os
+import sys
+
+# 設定基礎路徑
+BASE_PATH = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+sys.path.append(BASE_PATH)
+
+from services.binance_client import BinanceFuturesClient
+from executor.position import Position, CooldownManager
+
+
+class OrderExecutor:
+    """訂單執行器 - 完整版"""
+    
+    def __init__(self, client: BinanceFuturesClient, position_manager, config: Dict,
+                 cooldown_manager: Optional[CooldownManager] = None):
+        """
+        初始化執行器
+        
+        Args:
+            client: Binance API 客戶端
+            position_manager: 倉位管理器
+            config: 配置字典
+            cooldown_manager: 冷卻管理器（可選）
+        """
+        self.client = client
+        self.position_manager = position_manager
+        self.config = config.get('trading', {})
+        self.leverage = self.config.get('leverage', 10)
+        self.cooldown_manager = cooldown_manager
+        
+        # 交易日誌 - 使用絕對路徑
+        self.log_file = os.path.join(BASE_PATH, 'trades.csv')
+        self._init_trade_log()
+        
+        # 交易 ID 計數器
+        self.trade_counter = 0
+    
+    def _init_trade_log(self):
+        """初始化交易日誌檔案（完整欄位）"""
+        if not os.path.exists(self.log_file):
+            with open(self.log_file, 'w', newline='', encoding='utf-8-sig') as f:
+                writer = csv.writer(f)
+                # 完整欄位頭
+                writer.writerow([
+                    # 基礎識別
+                    'trade_id', 'timestamp_open', 'timestamp_close', 'symbol', 'side',
+                    # 倉位規模
+                    'leverage', 'quantity', 'entry_price', 'exit_price', 
+                    'position_value_usdt', 'margin_used_usdt',
+                    # 損益指標
+                    'pnl_usdt', 'pnl_percent', 'roi_percent', 'fee_usdt', 'net_pnl_usdt',
+                    # 持倉過程
+                    'highest_price', 'lowest_price', 'max_unrealized_pnl', 'max_unrealized_loss',
+                    'mae_percent', 'mfe_percent',
+                    # 出場原因
+                    'exit_type', 'exit_reason', 'holding_minutes', 'holding_seconds',
+                    # 市場環境
+                    'market_condition', 'volatility_atr', 'volume_ratio',
+                    # 策略參數
+                    'entry_reason', 'entry_score', 'ma_distance_percent',
+                    # 訂單資訊
+                    'order_id', 'fee_rate'
+                ])
+    
+    def _log_trade(self, **kwargs):
+        """
+        記錄完整交易到 CSV
+        
+        Args:
+            **kwargs: 所有欄位的字典
+        """
+        try:
+            with open(self.log_file, 'a', newline='', encoding='utf-8-sig') as f:
+                writer = csv.writer(f)
+                
+                # 從 kwargs 取得所有欄位，預設值為空
+                row = [
+                    kwargs.get('trade_id', ''),
+                    kwargs.get('timestamp_open', ''),
+                    kwargs.get('timestamp_close', datetime.now().strftime('%Y-%m-%d %H:%M:%S')),
+                    kwargs.get('symbol', ''),
+                    kwargs.get('side', ''),
+                    kwargs.get('leverage', ''),
+                    kwargs.get('quantity', ''),
+                    kwargs.get('entry_price', ''),
+                    kwargs.get('exit_price', ''),
+                    kwargs.get('position_value_usdt', ''),
+                    kwargs.get('margin_used_usdt', ''),
+                    kwargs.get('pnl_usdt', ''),
+                    kwargs.get('pnl_percent', ''),
+                    kwargs.get('roi_percent', ''),
+                    kwargs.get('fee_usdt', '0'),
+                    kwargs.get('net_pnl_usdt', ''),
+                    kwargs.get('highest_price', ''),
+                    kwargs.get('lowest_price', ''),
+                    kwargs.get('max_unrealized_pnl', ''),
+                    kwargs.get('max_unrealized_loss', ''),
+                    kwargs.get('mae_percent', ''),
+                    kwargs.get('mfe_percent', ''),
+                    kwargs.get('exit_type', ''),
+                    kwargs.get('exit_reason', ''),
+                    kwargs.get('holding_minutes', ''),
+                    kwargs.get('holding_seconds', ''),
+                    kwargs.get('market_condition', 'UNKNOWN'),
+                    kwargs.get('volatility_atr', '0'),
+                    kwargs.get('volume_ratio', '1'),
+                    kwargs.get('entry_reason', ''),
+                    kwargs.get('entry_score', '0'),
+                    kwargs.get('ma_distance_percent', ''),
+                    kwargs.get('order_id', ''),
+                    kwargs.get('fee_rate', '0.0002')
+                ]
+                writer.writerow(row)
+        except Exception as e:
+            print(f"[日誌錯誤] {str(e)}")
+    
+    def open_long(self, symbol: str, quantity: float, entry_reason: str = '', 
+                  entry_score: float = 0.0, ma_distance: float = 0.0,
+                  market_condition: str = 'UNKNOWN', volatility_atr: float = 0.0,
+                  volume_ratio: float = 1.0) -> Dict:
+        """
+        開多單（完整版）
+        
+        Args:
+            symbol: 交易對
+            quantity: 數量
+            entry_reason: 進場原因
+            entry_score: 進場分數
+            ma_distance: 與 MA 距離 (%)
+            market_condition: 市場狀態
+            volatility_atr: 波動度
+            volume_ratio: 成交量比率
+            
+        Returns:
+            訂單結果
+        """
+        try:
+            print(f"[開多單] {symbol} 數量：{quantity:.6f}")
+            
+            # 獲取最新價格（用於模擬下單）
+            ticker = self.client.get_ticker(symbol)
+            current_price = float(ticker.get('lastPrice', 0))
+            
+            # 設定槓桿
+            self.client.set_leverage(symbol, self.leverage)
+            
+            # 市價買入（傳入當前價格給模擬引擎）
+            order = self.client.place_order(
+                symbol=symbol,
+                side='BUY',
+                type='MARKET',
+                quantity=quantity,
+                price=current_price,  # 新增：傳入當前價格
+                leverage=self.leverage
+            )
+            
+            # 取得成交價格
+            price = float(order.get('avgPrice', 0))
+            if price == 0:
+                ticker = self.client.get_ticker(symbol)
+                price = float(ticker.get('lastPrice', 0))
+            
+            # 記錄持倉（包含完整資訊）
+            position = self.position_manager.add_position(
+                symbol=symbol,
+                entry_price=price,
+                quantity=quantity,
+                leverage=self.leverage,
+                side='LONG',
+                entry_reason=entry_reason,
+                entry_score=entry_score
+            )
+            
+            # 設定市場環境快照
+            position.market_condition = market_condition
+            position.volatility_atr = volatility_atr
+            position.volume_ratio = volume_ratio
+            
+            # 記錄日誌（開倉）
+            self._log_trade(
+                trade_id=f"T{self.trade_counter:06d}",
+                timestamp_open=datetime.now().strftime('%Y-%m-%d %H:%M:%S'),
+                symbol=symbol,
+                side='LONG',
+                leverage=self.leverage,
+                quantity=quantity,
+                entry_price=price,
+                position_value_usdt=price * quantity,
+                margin_used_usdt=(price * quantity) / self.leverage,
+                entry_reason=entry_reason,
+                entry_score=entry_score,
+                ma_distance_percent=ma_distance,
+                market_condition=market_condition,
+                volatility_atr=volatility_atr,
+                volume_ratio=volume_ratio,
+                order_id=order.get('orderId', '')
+            )
+            self.trade_counter += 1
+            
+            print(f"[成功] 買入 {symbol} @ {price:.4f}")
+            
+            return {
+                'success': True,
+                'symbol': symbol,
+                'action': 'OPEN_LONG',
+                'price': price,
+                'quantity': quantity,
+                'order': order
+            }
+            
+        except Exception as e:
+            print(f"[開單失敗] {symbol}: {str(e)}")
+            return {
+                'success': False,
+                'error': str(e)
+            }
+    
+    def close_position(self, symbol: str, quantity: Optional[float] = None,
+                       reason: str = '', order_type: str = '',
+                       exited_pnl_percent: Optional[float] = None) -> Dict:
+        """
+        平倉（全部或部分）- 完整版
+        
+        Args:
+            symbol: 交易對
+            quantity: 平倉數量（None 則全平）
+            reason: 平倉原因
+            order_type: 訂單類型
+            exited_pnl_percent: 出場時的收益率百分比
+            
+        Returns:
+            訂單結果
+        """
+        try:
+            position = self.position_manager.get_position(symbol)
+            if not position:
+                return {'success': False, 'error': '無此持倉'}
+            
+            # 預設全平
+            if quantity is None:
+                quantity = position.quantity
+            
+            # 取得當前價格
+            ticker = self.client.get_ticker(symbol)
+            current_price = float(ticker.get('lastPrice', 0))
+            
+            # 【修復】檢查最小名義金額（Binance 限制：每單最小 5 USDT）
+            order_value = quantity * current_price
+            if order_value < 5.0:
+                print(f"[警告] {symbol} 持倉價值 {order_value:.2f} USDT < 5 USDT，強制全平")
+                quantity = position.quantity
+                reason = f"{reason} (最小名義金額限制)"
+            
+            print(f"[平倉] {symbol} 數量：{quantity:.6f} ({reason})")
+            
+            # 計算 PnL
+            pnl = (current_price - position.entry_price) * quantity
+            pnl_percent = position.get_pnl_percent(current_price)
+            margin_used = position.get_margin()
+            roi = (pnl / margin_used * 100) if margin_used > 0 else 0
+            
+            # 計算手續費 (假設 0.02%)
+            fee_rate = 0.0002
+            fee = current_price * quantity * fee_rate
+            net_pnl = pnl - fee
+            
+            # 【關鍵修復】市價賣出（傳入當前價格給模擬引擎）
+            order = self.client.place_order(
+                symbol=symbol,
+                side='SELL',
+                type='MARKET',
+                quantity=quantity,
+                price=current_price  # 新增：傳入當前價格
+            )
+            
+            # 【修復】記錄部分平倉（只記錄基本資訊）
+            position.add_partial_exit(current_price, quantity, pnl)
+            position.set_exit(current_price, reason, order_type)
+            
+            # 【關鍵修復】判斷是否為全額平倉
+            if quantity >= position.quantity:
+                # 全額平倉：移除持倉並加入冷卻
+                self.position_manager.remove_position(symbol)
+                
+                # 加入冷卻清單
+                if self.cooldown_manager:
+                    self.cooldown_manager.add_cooldown(symbol)
+                    # 記錄交易到黑名單機制（如果有虧損）
+                    self.cooldown_manager.record_trade(symbol, net_pnl)
+                
+                # 記錄完整交易日誌
+                self._log_trade(
+                    trade_id=f"T{self.trade_counter:06d}",
+                    timestamp_open=position.open_time.strftime('%Y-%m-%d %H:%M:%S'),
+                    timestamp_close=datetime.now().strftime('%Y-%m-%d %H:%M:%S'),
+                    symbol=symbol,
+                    side=position.side,
+                    leverage=position.leverage,
+                    quantity=position.original_quantity,
+                    entry_price=position.entry_price,
+                    exit_price=current_price,
+                    position_value_usdt=current_price * quantity,
+                    margin_used_usdt=margin_used,
+                    pnl_usdt=pnl,
+                    pnl_percent=pnl_percent,
+                    roi_percent=roi,
+                    fee_usdt=fee,
+                    net_pnl_usdt=net_pnl,
+                    highest_price=position.highest_price,
+                    lowest_price=position.lowest_price,
+                    max_unrealized_pnl=position.max_unrealized_pnl,
+                    max_unrealized_loss=position.max_unrealized_loss,
+                    mae_percent=position.get_mae(),
+                    mfe_percent=position.get_mfe(),
+                    exit_type=order_type,
+                    exit_reason=reason,
+                    holding_minutes=position.get_holding_minutes(),
+                    holding_seconds=position.get_holding_seconds(),
+                    market_condition=position.market_condition,
+                    volatility_atr=position.volatility_atr,
+                    volume_ratio=position.volume_ratio,
+                    entry_reason=position.entry_reason,
+                    entry_score=position.entry_score,
+                    order_id=order.get('orderId', ''),
+                    fee_rate=fee_rate
+                )
+                self.trade_counter += 1
+            else:
+                # 部分平倉：只更新持倉數量，不移除，不加入冷卻
+                position.quantity -= quantity
+                print(f"[部分平倉] {symbol} 剩餘持倉：{position.quantity:.6f}")
+            
+            print(f"[成功] {symbol} 平倉 @ {current_price:.4f} | PnL: {pnl:.2f} USDT ({pnl_percent:.2f}%)")
+            
+            return {
+                'success': True,
+                'symbol': symbol,
+                'action': 'CLOSE',
+                'price': current_price,
+                'quantity': quantity,
+                'pnl': pnl,
+                'pnl_percent': pnl_percent,
+                'order': order
+            }
+            
+        except Exception as e:
+            print(f"[平倉失敗] {symbol}: {str(e)}")
+            return {
+                'success': False,
+                'error': str(e)
+            }
+    
+    def reduce_position(self, symbol: str, ratio: float, reason: str = '',
+                        exited_pnl_percent: Optional[float] = None) -> Dict:
+        """
+        減持（按比例）
+        
+        Args:
+            symbol: 交易對
+            ratio: 平倉比例 (0.0-1.0)
+            reason: 平倉原因
+            exited_pnl_percent: 出場時的收益率百分比
+            
+        Returns:
+            訂單結果
+        """
+        position = self.position_manager.get_position(symbol)
+        if not position:
+            return {'success': False, 'error': '無此持倉'}
+        
+        # 計算要平倉的數量
+        quantity = position.quantity * ratio
+        
+        # 調用 close_position 並指定數量
+        return self.close_position(symbol, quantity, reason, 'REDUCE', exited_pnl_percent)
+    
+    def get_current_price(self, symbol: str) -> float:
+        """取得當前價格"""
+        ticker = self.client.get_ticker(symbol)
+        return float(ticker.get('lastPrice', 0))
+    
+    def get_account_summary(self) -> Dict:
+        """取得帳戶概要"""
+        try:
+            account = self.client.get_account_info()
+            balance = self.client.get_usdt_balance()
+            
+            return {
+                'total_balance': float(account.get('totalWalletBalance', 0)),
+                'available_balance': balance,
+                'unrealized_pnl': float(account.get('crossUnPnl', 0)),
+                'positions_count': self.position_manager.get_position_count()
+            }
+        except Exception as e:
+            return {'error': str(e)}

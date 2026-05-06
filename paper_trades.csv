@@ -1,0 +1,1 @@
+﻿trade_id,timestamp_open,timestamp_close,symbol,side,leverage,quantity,entry_price,exit_price,position_value,margin,pnl_usdt,pnl_percent,roi_percent,fee_usdt,net_pnl,exit_reason,holding_time

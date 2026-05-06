@@ -1,0 +1,872 @@
+# -*- coding: utf-8 -*-
+"""
+CryptoAI Trader - 幣安自動交易機器人
+支援最多 3 個倉位同時持倉
+
+使用方法：
+    python main.py
+
+作者: CryptoAI Team
+"""
+
+import sys
+import time
+import os
+import select
+import threading
+import queue
+from datetime import datetime
+from typing import Dict
+
+# Windows 優先使用 msvcrt（非阻塞鍵盤檢測）
+if sys.platform == "win32":
+    import msvcrt
+
+# 確保路徑正確
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+
+from services.binance_client import BinanceFuturesClient
+from analyzer.screener import Screener
+from analyzer.trend import TrendAnalyzer
+from analyzer.signal import SignalGenerator
+from executor.position import PositionManager
+from executor.risk import RiskManager
+from executor.order import OrderExecutor
+from executor.trade_monitor import TradeMonitor
+
+
+class CryptoAITrader:
+    """CryptoAI 交易機器人"""
+
+    def __init__(self, config: dict):
+        """
+        初始化交易機器人
+
+        Args:
+            config: 設定字典
+        """
+        self.config = config
+        self.running = False
+
+        # 初始化客戶端
+        self.client = create_client(
+            api_key=config["api"]["api_key"],
+            api_secret=config["api"]["api_secret"],
+            testnet=config["api"]["testnet"],
+        )
+
+        # 初始化分析器
+        self.screener = Screener(
+            min_price_change=config["screening"]["min_price_change"],
+            min_volume=config["screening"]["min_volume_24h"],
+            max_price_change=config["screening"].get("max_price_change", 25),
+        )
+        self.trend_analyzer = TrendAnalyzer(
+            ma_period=config["screening"]["trend_ma_period"]
+        )
+        self.signal_generator = SignalGenerator(self.trend_analyzer)
+
+        # 初始化執行器
+        self.position_manager = PositionManager("positions.json")
+        self.risk_manager = RiskManager(
+            stop_loss=config["trading"]["stop_loss"],
+            partial_exit_pnl=config["trading"]["partial_exit_pnl"],
+            full_exit_pnl=config["trading"]["full_exit_pnl"],
+            leverage=config["trading"]["leverage"],
+            initial_capital=config["trading"]["initial_capital"],
+            trailing_stop_enabled=config["trading"].get("trailing_stop_enabled", True),
+            trailing_stop_distance=config["trading"].get("trailing_stop_distance", 5),
+        )
+        self.order_executor = OrderExecutor(
+            self.client, self.position_manager, self.risk_manager
+        )
+
+        # 交易參數
+        self.max_positions = config["trading"]["max_position"]
+        self.check_interval = config["trading"]["check_interval"]
+        self.leverage = config["trading"]["leverage"]
+
+        # 命令隊列（用於多線程命令輸入）
+        self.command_queue = queue.Queue()
+        self.command_thread = None
+        self.command_event = threading.Event()
+
+        # 交易監控
+        self.trade_monitor = TradeMonitor(
+            trigger_interval=config["trading"].get("monitor_interval", 100)
+        )
+
+    def test_connection(self) -> bool:
+        """測試連線"""
+        print("\n" + "=" * 50)
+        print("連線測試中...")
+
+        if self.client.simulated:
+            print("[模擬模式] 未輸入 API Key，使用模擬數據")
+            print(f"  URL: testnet.binancefuture.com (測試網)")
+            return True
+
+        if self.client.test_connection():
+            url = (
+                "testnet.binancefuture.com"
+                if self.client.testnet
+                else "fapi.binance.com"
+            )
+            print(f"[OK] 已連線至 {url}")
+            return True
+        else:
+            print("[錯誤] 連線失敗")
+            return False
+
+    def check_and_manage_positions(self) -> int:
+        """
+        檢查並管理現有持倉
+
+        Returns:
+            平倉次數
+        """
+        positions = self.position_manager.get_all_positions()
+        if not positions:
+            return 0
+
+        close_count = 0
+
+        for position in positions:
+            symbol = position["symbol"]
+
+            try:
+                # 取得最新價格
+                current_price = self.client.get_symbol_price(symbol)
+
+                # 計算盈虧
+                pnl_info = self.position_manager.calculate_pnl(position, current_price)
+                pnl = pnl_info["pnl"]
+                pnl_percent = pnl_info["pnl_percent"]
+
+                # 取得止損/止盈價格
+                stop_loss_price = position.get("stop_loss_price", 0)
+                partial_exit_price = position.get("partial_exit_price", 0)
+                full_exit_price = position.get("full_exit_price", 0)
+
+                # 如果啟用了移動止損，先更新止損線
+                trailing_info = ""
+                if self.risk_manager.trailing_stop_price is not None:
+                    self.risk_manager.update_trailing_stop(current_price)
+                    trailing_info = (
+                        f" | 移動止損: {self.risk_manager.trailing_stop_price:.4f}"
+                    )
+
+                # 檢查是否觸發移動止損
+                if self.risk_manager.should_trailing_stop(current_price):
+                    print(
+                        f" {symbol}: {current_price} | PnL: {pnl} USDT ({pnl_percent}%){trailing_info}"
+                    )
+                    print(f" → 觸發移動止損")
+                    result = self.order_executor.execute_sell_signal(symbol, "FULL")
+                    if result["success"]:
+                        close_count += 1
+                        self.risk_manager.reset_trailing_stop()
+                        self._log_trade(
+                            self._build_trade_data(
+                                position, "移動止損", current_price, 0, pnl
+                            )
+                        )
+                        return close_count
+
+                # 顯示持倉狀態
+                print(
+                    f" {symbol}: {current_price} | PnL: {pnl} USDT ({pnl_percent}%){trailing_info}"
+                )
+
+                # 檢查平倉條件
+                if pnl <= -self.config["trading"]["stop_loss"]:
+                    # 止損
+                    print(f" → 觸發止損 (虧損 {pnl} USDT)")
+                    result = self.order_executor.execute_sell_signal(symbol, "FULL")
+                    if result["success"]:
+                        close_count += 1
+                        self._log_trade(
+                            self._build_trade_data(
+                                position, "止損", current_price, 0, pnl
+                            )
+                        )
+
+                elif pnl_percent >= self.config["trading"]["full_exit_pnl"]:
+                    # 全數止盈
+                    print(f" → 觸發全數止盈 (收益 {pnl_percent}%)")
+                    result = self.order_executor.execute_sell_signal(symbol, "FULL")
+                    if result["success"]:
+                        close_count += 1
+                        self._log_trade(
+                            self._build_trade_data(
+                                position, "全數止盈", current_price, 0, pnl
+                            )
+                        )
+
+                elif pnl_percent >= self.config["trading"]["partial_exit_pnl"]:
+                    # 部分止盈
+                    print(f" → 觸發部分止盈 (收益 {pnl_percent}%)")
+                    result = self.order_executor.execute_sell_signal(symbol, "PARTIAL")
+                    if result["success"]:
+                        close_count += 1
+                        # 啟用移動止損
+                        pos_entry_price = position.get("entry_price", current_price)
+                        self.risk_manager.enable_trailing_stop(pos_entry_price)
+                        self.risk_manager.highest_price = current_price
+                        self._log_trade(
+                            self._build_trade_data(
+                                position,
+                                "部分止盈",
+                                current_price,
+                                position["quantity"] * 0.5,
+                                pnl * 0.5,
+                            )
+                        )
+                        # 顯示移動止損資訊
+                        print(
+                            f" [移動止損] 已啟用，距離: {self.config['trading'].get('trailing_stop_distance', 5)}%"
+                        )
+
+            except Exception as e:
+                print(f" [錯誤] 管理持倉 {symbol} 失敗: {e}")
+
+        return close_count
+
+    def find_and_open_positions(self) -> int:
+        """
+        尋找訊號並開倉
+
+        Returns:
+            開倉次數
+        """
+        open_count = 0
+        current_positions = self.position_manager.get_position_count()
+
+        # 檢查是否可以再開新倉位
+        while current_positions < self.max_positions:
+            print(f"\n[選幣中] 掃描候選幣種...")
+
+            try:
+                # 取得所有交易對行情
+                tickers = self.client.get_all_tickers()
+                print(f"  取得 {len(tickers)} 個交易對")
+
+                # 篩選候選幣種
+                candidates = self.screener.get_top_candidates(
+                    tickers, top_n=10, simulated=self.client.simulated
+                )
+
+                if not candidates:
+                    print("  [警告] 沒有符合條件的候選幣種")
+                    break
+
+                print(f"  候選幣種: {', '.join([c['symbol'] for c in candidates[:5]])}")
+
+                # 嘗試每個候選幣種
+                found_signal = False
+                for candidate in candidates:
+                    symbol = candidate["symbol"]
+
+                    # 跳過已有持倉的幣種
+                    if self.position_manager.has_position_for_symbol(symbol):
+                        continue
+
+                    print(f"\n  分析中: {symbol}...")
+
+                    # 趨勢分析
+                    try:
+                        klines = self.client.get_klines(symbol, "1h", 50)
+                        trend = self.trend_analyzer.analyze_trend(
+                            symbol, klines, self.client.simulated
+                        )
+
+                        print(
+                            f"    趨勢: {trend['trend']}, MA: {trend['ma_value']}, "
+                            f"價格: {trend['current_price']}, 成交量比: {trend['volume_ratio']}"
+                        )
+                        print(
+                            f"    布林帶: 上軌={trend['bb_upper']}, 中軌={trend['bb_middle']}, "
+                            f"位置={trend['bb_position']:.0%}"
+                        )
+
+                        # 產生買入訊號
+                        signal = self.signal_generator.generate_buy_signal(
+                            symbol, trend
+                        )
+
+                        if signal:
+                            print(
+                                f"    [買入訊號] 信心: {signal['confidence']}, 原因: {signal['reason']}"
+                            )
+
+                            # 計算倉位大小
+                            entry_price = signal["price"]
+                            pos_size = self.risk_manager.calculate_position_size(
+                                entry_price
+                            )
+
+                            print(
+                                f"    倉位: 價值 {pos_size['position_value']} USDT, "
+                                f"保證金 {pos_size['margin']} USDT, 數量 {pos_size['quantity']}"
+                            )
+
+                            # 開倉
+                            result = self.order_executor.open_position(
+                                symbol=symbol,
+                                quantity=pos_size["quantity"],
+                                entry_price=entry_price,
+                                leverage=self.leverage,
+                            )
+
+                            if result["success"]:
+                                open_count += 1
+                                current_positions += 1
+                                print(f"    [成功] {result['message']}")
+                                open_trade_data = {
+                                    "position_id": f"POS_{symbol}_{datetime.now().strftime('%Y%m%d%H%M%S')}",
+                                    "open_time": datetime.now().isoformat(),
+                                    "close_time": "",
+                                    "holding_minutes": 0,
+                                    "leverage": self.leverage,
+                                    "position_value": pos_size["position_value"],
+                                    "price_change": trend.get("price_change", 0),
+                                    "volume": trend.get("volume", 0),
+                                    "rank": candidate.get("rank", 0),
+                                    "factor_score": signal.get("confidence", 0),
+                                    "entry_reason": signal.get("reason", ""),
+                                    "stop_loss_price": 0,
+                                    "full_exit_price": 0,
+                                    "partial_exit_price": 0,
+                                    "stop_loss_amount": self.config["trading"][
+                                        "stop_loss"
+                                    ],
+                                    "risk_reward_ratio": self.config["trading"][
+                                        "full_exit_pnl"
+                                    ]
+                                    / (
+                                        self.config["trading"]["stop_loss"]
+                                        / pos_size["position_value"]
+                                        * 100
+                                    ),
+                                    "trend": trend.get("trend", ""),
+                                    "ma_position": trend.get("bb_position", 0),
+                                    "volatility": 0,
+                                    "total_positions": current_positions,
+                                    "order_type": "MARKET",
+                                    "slippage": 0,
+                                    "fee": round(
+                                        pos_size["position_value"] * 0.0004, 2
+                                    ),
+                                    "order_id": result.get("order_id", ""),
+                                    "entry_price": entry_price,
+                                    "exit_price": 0,
+                                    "quantity": pos_size["quantity"],
+                                    "pnl_percent": 0,
+                                    "max_profit": 0,
+                                    "max_loss": 0,
+                                    "close_reason": "買入",
+                                }
+                                self._log_trade(open_trade_data)
+                                found_signal = True
+                                break  # 開倉後跳出，繼續檢查是否有更多倉位
+                            else:
+                                print(f"    [失敗] {result['message']}")
+
+                    except Exception as e:
+                        print(f"    [錯誤] 分析失敗: {e}")
+                        continue
+
+                # 沒有找到訊號或無法再開倉
+                if not found_signal:
+                    break
+
+            except Exception as e:
+                print(f"[錯誤] 選幣失敗: {e}")
+                break
+
+        return open_count
+
+    def _log_trade(self, trade_data: Dict):
+        """記錄交易到 CSV（完整數據）"""
+        try:
+            log_file = "trades.csv"
+            is_new = not os.path.exists(log_file)
+
+            with open(log_file, "a", encoding="utf-8-sig") as f:
+                if is_new:
+                    header = self._get_csv_header()
+                    f.write(header + "\n")
+
+                row = self._format_csv_row(trade_data)
+                f.write(row + "\n")
+
+            # 記錄交易並檢查是否觸發監控
+            self.trade_monitor.record_trade(trade_data)
+        except Exception as e:
+            print(f"[警告] 記錄交易失敗: {e}")
+
+    def _get_csv_header(self) -> str:
+        """取得 CSV 表頭"""
+        return (
+            "倉位ID,建倉時間,平倉時間,持有時長(分),槓桿,倉位價值(USDT),"
+            "價格變動率(%),成交量(USDT),排行,因子總分,進場原因,"
+            "止損價格,止盈價格,止盈觸發價,止損比例,風險報酬比,"
+            "當���趨勢,MA位置,市場波動率,總持倉數,"
+            "訂單類型,滑點,手續費,訂單ID,"
+            "進場價格,出場價格,數量,報酬率(%),最高獲利,最大虧損,平倉原因"
+        )
+
+    def _format_csv_row(self, data: Dict) -> str:
+        """格式化 CSV 行"""
+        return (
+            f"{data.get('position_id', '')},"
+            f"{data.get('open_time', '')},"
+            f"{data.get('close_time', '')},"
+            f"{data.get('holding_minutes', 0)},"
+            f"{data.get('leverage', 10)},"
+            f"{data.get('position_value', 0)},"
+            f"{data.get('price_change', 0)},"
+            f"{data.get('volume', 0)},"
+            f"{data.get('rank', 0)},"
+            f"{data.get('factor_score', 0)},"
+            f"{data.get('entry_reason', '')},"
+            f"{data.get('stop_loss_price', 0)},"
+            f"{data.get('full_exit_price', 0)},"
+            f"{data.get('partial_exit_price', 0)},"
+            f"{data.get('stop_loss_amount', 0)},"
+            f"{data.get('risk_reward_ratio', 0)},"
+            f"{data.get('trend', '')},"
+            f"{data.get('ma_position', '')},"
+            f"{data.get('volatility', 0)},"
+            f"{data.get('total_positions', 0)},"
+            f"{data.get('order_type', 'MARKET')},"
+            f"{data.get('slippage', 0)},"
+            f"{data.get('fee', 0)},"
+            f"{data.get('order_id', '')},"
+            f"{data.get('entry_price', 0)},"
+            f"{data.get('exit_price', 0)},"
+            f"{data.get('quantity', 0)},"
+            f"{data.get('pnl_percent', 0)},"
+            f"{data.get('max_profit', 0)},"
+            f"{data.get('max_loss', 0)},"
+            f"{data.get('close_reason', '')}"
+        )
+
+    def _build_trade_data(
+        self,
+        position: Dict,
+        close_reason: str,
+        exit_price: float,
+        exit_quantity: float,
+        pnl: float,
+    ) -> Dict:
+        """構建完整的交易數據"""
+        now = datetime.now()
+        open_time = datetime.fromisoformat(position.get("open_time", now.isoformat()))
+        close_time = now.isoformat()
+        holding_minutes = int((now - open_time).total_seconds() / 60)
+
+        entry_price = position.get("entry_price", 0)
+        quantity = exit_quantity if exit_quantity > 0 else position.get("quantity", 0)
+        leverage = position.get("leverage", 10)
+        position_value = entry_price * quantity
+
+        return {
+            "position_id": f"POS_{position.get('symbol', '')}_{position.get('open_time', '').replace(':', '').replace('-', '')}",
+            "open_time": position.get("open_time", ""),
+            "close_time": close_time,
+            "holding_minutes": holding_minutes,
+            "leverage": leverage,
+            "position_value": round(position_value, 2),
+            "price_change": position.get("price_change", 0),
+            "volume": position.get("volume", 0),
+            "rank": position.get("rank", 0),
+            "factor_score": position.get("factor_score", 0),
+            "entry_reason": position.get("entry_reason", ""),
+            "stop_loss_price": position.get("stop_loss_price", 0),
+            "full_exit_price": position.get("full_exit_price", 0),
+            "partial_exit_price": position.get("partial_exit_price", 0),
+            "stop_loss_amount": self.config["trading"]["stop_loss"],
+            "risk_reward_ratio": position.get("full_exit_price", 0)
+            / position.get("stop_loss_price", 1)
+            if position.get("stop_loss_price", 0) > 0
+            else 0,
+            "trend": position.get("trend", ""),
+            "ma_position": position.get("ma_position", ""),
+            "volatility": position.get("volatility", 0),
+            "total_positions": self.position_manager.get_position_count(),
+            "order_type": "MARKET",
+            "slippage": round(abs(exit_price - entry_price), 6),
+            "fee": round(position_value * 0.0004, 2),
+            "order_id": "",
+            "entry_price": entry_price,
+            "exit_price": exit_price,
+            "quantity": round(quantity, 4),
+            "pnl_percent": round(
+                (pnl / position_value * leverage * 100) if position_value > 0 else 0, 2
+            ),
+            "max_profit": position.get("max_profit", pnl),
+            "max_loss": position.get("max_loss", pnl),
+            "close_reason": close_reason,
+        }
+
+    def print_status(self):
+        """顯示狀態"""
+        print("\n" + "=" * 50)
+        print(f"[{datetime.now().strftime('%H:%M:%S')}] === 檢查中 ===")
+
+        # 餘額
+        balance = self.client.get_balance()
+        print(f"餘額: {balance:.2f} USDT")
+
+        # 持倉狀態
+        positions = self.position_manager.get_all_positions()
+        print(f"持倉: {len(positions)} / {self.max_positions}")
+
+        if positions:
+            for pos in positions:
+                print(f"  - {pos['symbol']}: {pos['quantity']} @ {pos['entry_price']}")
+
+    def run(self):
+        """執行交易機器人"""
+        self.running = True
+
+        # 啟動命令監聽線程
+        self.command_thread = threading.Thread(target=self._command_listener)
+        self.command_thread.start()
+
+        # 連線測試
+        if not self.test_connection():
+            print("[錯誤] 無法連線至幣安，請檢查 API Key")
+            return
+
+        print("\n" + "=" * 50)
+        print("CryptoAI Trader 啟動")
+        print(f"  檢查間隔: {self.check_interval} 分鐘")
+        print(f"  最大持倉: {self.max_positions}")
+        print(f"  槓桿: {self.leverage}x")
+        print(f"  止損: {self.config['trading']['stop_loss']} USDT")
+        print(f"  部分止盈: {self.config['trading']['partial_exit_pnl']}%")
+        print(f"  全數止盈: {self.config['trading']['full_exit_pnl']}%")
+        print("=" * 50)
+        print("\n按 Ctrl+C 可停止交易機器人")
+        print("-" * 50)
+
+        try:
+            while self.running:
+                try:
+                    # 處理命令隊列（即時命令）
+                    processed = 0
+                    while not self.command_queue.empty():
+                        try:
+                            cmd = self.command_queue.get_nowait()
+                            self._handle_command(cmd)
+                            processed += 1
+                        except queue.Empty:
+                            break
+                    if processed > 0:
+                        print(f"[命令] 已處理 {processed} 個命令\n")
+
+                    # 顯示狀態
+                    self.print_status()
+
+                    # 步驟 1：檢查並管理現有持倉
+                    print("\n[步驟 1] 檢查持倉...")
+                    close_count = self.check_and_manage_positions()
+                    if close_count > 0:
+                        print(f"  平倉 {close_count} 筆")
+
+                    # 步驟 2：尋找新訊號開倉
+                    print("\n[步驟 2] 檢查買入訊號...")
+                    open_count = self.find_and_open_positions()
+                    if open_count > 0:
+                        print(f"  開倉 {open_count} 筆")
+
+                    print(f"\n[{datetime.now().strftime('%H:%M:%S')}] 本輪檢查完成")
+
+                except Exception as e:
+                    print(f"[錯誤] 檢查失敗: {e}")
+
+                # 等待下次檢查
+                print(f"\n等待 {self.check_interval} 分鐘後再次檢查（可輸入命令）...")
+                print("-" * 50)
+                for _ in range(self.check_interval * 60):
+                    if self.command_event.wait(timeout=1):
+                        self.command_event.clear()
+                        break
+
+        except KeyboardInterrupt:
+            print("\n\n[訊息] 收到停止信號，正在關閉...")
+            self.stop()
+
+    def stop(self):
+        """停止交易機器人"""
+        self.running = False
+        if self.command_thread and self.command_thread.is_alive():
+            try:
+                sys.stdin.close()
+            except Exception:
+                pass
+            self.command_thread.join(timeout=2)
+        print("[訊息] CryptoAI Trader 已停止")
+
+    def process_manual_commands(self) -> int:
+        """
+        處理手動命令（非阻塞）
+
+        Returns:
+            處理命令的數量
+        """
+        count = 0
+
+        if sys.platform == "win32":
+            # Windows: 使用 msvcrt 非阻塞檢查（單次檢查，不阻塞）
+            if msvcrt.kbhit():
+                try:
+                    line = sys.stdin.readline()
+                    if line:
+                        cmd = line.strip().lower()
+                        if cmd:
+                            count += 1
+                            self._handle_command(cmd)
+                except Exception as e:
+                    print(f"[命令錯誤] {e}")
+        else:
+            # Unix/Linux/macOS: 使用 select（單次檢查）
+            if sys.stdin in select.select([sys.stdin], [], [], 0)[0]:
+                try:
+                    line = sys.stdin.readline()
+                    if line:
+                        cmd = line.strip().lower()
+                        if cmd:
+                            count += 1
+                            self._handle_command(cmd)
+                except Exception as e:
+                    print(f"[命令錯誤] {e}")
+
+        return count
+
+    def _command_listener(self):
+        """獨立線程：監聽命令輸入（使用 input()）"""
+        while self.running:
+            try:
+                cmd = input().strip().lower()
+                if cmd and self.running:
+                    self.command_queue.put(cmd)
+                    self.command_event.set()
+            except EOFError:
+                break
+            except Exception:
+                pass
+
+    def _handle_command(self, cmd: str):
+        """處理單個命令"""
+        parts = cmd.split()
+        if not parts:
+            return
+
+        action = parts[0]
+
+        if action == "help":
+            self._show_help()
+
+        elif action == "status":
+            self._manual_status()
+
+        elif action == "positions":
+            self._manual_positions()
+
+        elif action == "close":
+            if len(parts) < 2:
+                print("[命令] 用法: close <symbol> 或 closeall")
+            else:
+                self._manual_close(parts[1])
+
+        elif action == "closeall":
+            self._manual_close_all()
+
+        elif action == "exit":
+            print("[訊息] 收到退出命令...")
+            self.stop()
+
+        else:
+            print(f"[未知命令] {action}，輸入 help 查看可用命令")
+
+    def _show_help(self):
+        """顯示命令幫助"""
+        print("""
+=== 手動命令 ===
+ help              顯示此幫助資訊
+ status            顯示帳戶狀態
+ positions         顯示目前持倉
+ close <symbol>    手動平倉指定幣種（如 close BTCUSDT）
+ closeall          手動平倉所有持倉
+ exit              停止交易機器人
+""")
+
+    def _manual_status(self):
+        """顯示帳戶狀態"""
+        balance = self.client.get_balance()
+        positions = self.position_manager.get_all_positions()
+        print(f"\n=== 帳戶狀態 ===")
+        print(f"餘額: {balance:.2f} USDT")
+        print(f"持倉: {len(positions)} / {self.max_positions}")
+        if positions:
+            for pos in positions:
+                current_price = self.client.get_symbol_price(pos["symbol"])
+                pnl_info = self.position_manager.calculate_pnl(pos, current_price)
+                print(
+                    f" - {pos['symbol']}: {pos['quantity']} @ {pos['entry_price']} | PnL: {pnl_info['pnl']:.2f} USDT ({pnl_info['pnl_percent']:.2f}%)"
+                )
+        print("================\n")
+
+    def _manual_positions(self):
+        """顯示持倉"""
+        positions = self.position_manager.get_all_positions()
+        if not positions:
+            print("[持倉] 目前沒有持倉")
+            return
+        print(f"\n=== 持倉 ({len(positions)} 筆) ===")
+        for pos in positions:
+            symbol = pos["symbol"]
+            current_price = self.client.get_symbol_price(symbol)
+            pnl_info = self.position_manager.calculate_pnl(pos, current_price)
+            print(
+                f" {symbol}: 數量={pos['quantity']}, 進場={pos['entry_price']}, 現在={current_price}, PnL={pnl_info['pnl']:.2f} USDT ({pnl_info['pnl_percent']:.2f}%)"
+            )
+        print("========================\n")
+
+    def _manual_close(self, symbol: str):
+        """手動平倉指定幣種"""
+        symbol = symbol.upper()
+        if not self.position_manager.has_position_for_symbol(symbol):
+            print(f"[警告] 無 {symbol} 持倉")
+            return
+        try:
+            current_price = self.client.get_symbol_price(symbol)
+            pos = self.position_manager.get_position_by_symbol(symbol)
+            if not pos:
+                return
+            pnl_info = self.position_manager.calculate_pnl(pos, current_price)
+            result = self.order_executor.close_position_by_symbol(
+                symbol, reason="手動平倉"
+            )
+            if result["success"]:
+                print(
+                    f"[成功] {symbol} 已平倉 @ {current_price}, PnL: {pnl_info['pnl']:.2f} USDT"
+                )
+                pos = self.position_manager.get_position_by_symbol(symbol)
+                if pos:
+                    self._log_trade(
+                        self._build_trade_data(
+                            pos,
+                            "手動平倉",
+                            current_price,
+                            result.get("order", {}).get("executedQty", 0),
+                            pnl_info["pnl"],
+                        )
+                    )
+            else:
+                print(f"[失敗] {result['message']}")
+        except Exception as e:
+            print(f"[錯誤] 平倉失敗: {e}")
+
+    def _manual_close_all(self):
+        """手動平倉所有持倉"""
+        positions = self.position_manager.get_all_positions()
+        if not positions:
+            print("[警告] 目前沒有持倉")
+            return
+        print(f"[命令] 即將平倉 {len(positions)} 個持倉...")
+        for pos in positions:
+            symbol = pos["symbol"]
+            try:
+                self._manual_close(symbol)
+            except Exception as e:
+                print(f"[錯誤] 平倉 {symbol} 失敗: {e}")
+
+
+def get_api_input() -> dict:
+    """
+    取得 API 輸入
+
+    Returns:
+        API 設定字典
+    """
+    print("\n" + "=" * 50)
+    print("  CryptoAI Trader - 幣安自動交易機器人")
+    print("  支援最多 3 個倉位同時持倉")
+    print("=" * 50)
+
+    print("\n[API 設定]")
+    print("提示: 直接按 Enter 可使用模擬模式（不實際交易）")
+    print("      模擬模式會使用隨機數據進行測試")
+
+    # API Key
+    api_key = input("\n請輸入 API Key: ").strip()
+
+    # API Secret
+    api_secret = input("請輸入 API Secret: ").strip()
+
+    # 測試網/正式網
+    print("\n選擇網路:")
+    print("  1. 測試網 (testnet.binancefuture.com) - 推薦測試使用")
+    print("  2. 正式網 (fapi.binance.com) - 真實交易")
+
+    network_choice = input("\n選擇 (1/2) [預設: 1]: ").strip() or "1"
+    testnet = network_choice != "2"
+
+    return {"api_key": api_key, "api_secret": api_secret, "testnet": testnet}
+
+
+def get_default_config() -> dict:
+    """取得預設設定"""
+    return {
+        "api": {"api_key": "", "api_secret": "", "testnet": True},
+        "trading": {
+            "check_interval": 1,  # 分鐘
+            "max_position": 3,  # 最多 3 個持倉
+            "leverage": 10,  # 10x 槓桿
+            "stop_loss": 5,  # 止損 5 USDT
+ "partial_exit_pnl": 80, # 部分止盈 80%
+    "full_exit_pnl": 300, # 全數止盈 300%
+            "initial_capital": 100,  # 初始資金
+ "monitor_interval": 100, # 監控間隔
+    },
+    "screening": {
+        "min_price_change": 20, # 最小漲幅 20%
+        "min_volume_24h": 10000000, # 最小成交量 1000萬 USDT
+        "trend_ma_period": 20, # MA 週期
+    },
+}
+
+
+def main():
+    """主程式"""
+    # 讀取 API 設定
+    api_config = get_api_input()
+
+    # 建立設定
+    config = get_default_config()
+    config["api"].update(api_config)
+
+    # 顯示設定摘要
+    print("\n" + "=" * 50)
+    print("[設定摘要]")
+    if config["api"]["api_key"]:
+        network = "測試網" if config["api"]["testnet"] else "正式網"
+        print(f"  網路: {network}")
+        print(f"  API Key: {config['api']['api_key'][:8]}...")
+    else:
+        print("  網路: 模擬模式（無實際交易）")
+    print(f"  最大持倉: {config['trading']['max_position']}")
+    print(f"  槓桿: {config['trading']['leverage']}x")
+    print("=" * 50)
+
+    # 建立並執行交易機器人
+    trader = CryptoAITrader(config)
+    trader.run()
+
+
+if __name__ == "__main__":
+    main()

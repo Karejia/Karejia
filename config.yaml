@@ -1,0 +1,116 @@
+# CryptoAI 交易系統配置檔 (進階混合策略版)
+# API 配置 - 運行時輸入，此處保留空白
+api:
+  api_key: ""
+  api_secret: ""
+  testnet: true
+
+# 數據源配置
+use_mainnet_data: true
+
+# 代理配置（可選，用於連接 Binance API）
+proxy_url: null
+
+# 交易配置 v2.0
+trading:
+  # 基礎設定
+  check_interval: 10
+  max_position: 3
+  leverage: 10
+
+  # 雙層檢查架構
+  fast_check_interval: 1    # 快循環：1秒檢查持倉價格（WebSocket）
+  slow_check_interval: 10   # 慢循環：10秒選幣篩選（REST API）
+  
+  # 資金配置
+  capital_mode: "fixed"
+  fixed_capital_per_position: 10
+  percent_capital_per_position: 10
+  
+  # 固定止損 (8%)
+  stop_loss_percent: 8
+  
+  # 兩階段移動止盈
+  trailing_stop_enabled: true
+  trailing_phase1_trigger: 8       # Phase 1 觸發：8%
+  trailing_phase1_retention: 0.50  # Phase 1 保留：50%
+  trailing_phase2_trigger: 10      # Phase 2 觸發：10%
+  trailing_phase2_retention: 0.67  # Phase 2 保留：67%
+  
+  # 全數止盈 (40%)
+  full_exit_percent: 40
+  
+  # 初始資金
+  initial_capital: 1000
+
+  # 時段權重（UTC）
+  # 全時段交易：全部設為 1.0（不跳過、不加減頻率）
+  hour_weight:
+    "00-06": 1.0
+    "07-12": 1.0
+    "13-18": 1.0
+    "19-22": 1.0
+    "23-23": 1.0
+
+# 冷卻配置
+cooldown:
+  enabled: true
+  duration_minutes: 3
+  blacklist_window_minutes: 60
+  blacklist_threshold: 2
+  blacklist_duration_minutes: 60
+
+# 分批出場配置【已停用】
+# scaling_out:
+#   50: 0.25
+#   100: 0.25
+#   150: 0.25
+#   200: 0.25
+
+# 選幣配置 (進階混合模式)
+screening:
+  # 模式選擇
+  mode: 'hybrid'
+  
+  # 資金分配
+  sleeper_ratio: 0.5
+  breakout_ratio: 0.5
+  
+  top_n: 10
+
+  # 漲幅過濾範圍
+  min_price_change: 5.0
+  max_price_change: 21.0
+
+  # 潛伏模式參數
+  sleeper:
+    max_price_change: 5.0
+    min_price_change: -5.0
+    volatility_threshold: 3.0
+    oi_increase_ratio: 0.10
+    long_ratio_min: 0.52
+    min_volume_24h: 500000
+  
+  # 突破模式參數
+  breakout:
+    min_price_change: 3.0
+    max_price_change: 15.0
+    volume_ratio: 2.0
+    ma_breakout: true
+    min_volume_24h: 1000000
+
+# 通用進階因子
+enable_sentiment: true
+sentiment_weight: 0.4
+technical_weight: 0.4
+volume_weight: 0.2
+
+# 趨勢分析配置
+trend:
+  ma_period: 20
+  volume_ma_period: 10
+
+# 日誌配置
+logging:
+  level: "INFO"
+  file: "cryptoai.log"
